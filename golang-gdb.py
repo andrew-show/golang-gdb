@@ -415,6 +415,7 @@ def linked_list(ptr, linkfield):
                 yield ptr
                 ptr = ptr[linkfield]
 
+
 class Goroutine:
         IDLE = read_runtime_const("'runtime._Gidle'", 0)
         RUNNABLE = read_runtime_const("'runtime._Grunnable'", 1)
@@ -449,6 +450,8 @@ class Goroutine:
         }
 
         SIZEOF_ADDRESS = gdb.lookup_type("void").pointer().sizeof
+
+        __the_g = None
 
         def __init__(self, base):
                 self.__g = base
@@ -547,7 +550,6 @@ class Goroutine:
                                return Goroutine(g)
                 return None
 
-
 class GoroutinesCmd(gdb.Command):
         "List all goroutines."
 
@@ -565,19 +567,64 @@ class GoroutinesCmd(gdb.Command):
                       g.print()
 
 
-class GoroutineContext:
-        def __init__(self, g):
-                self.__g = g
-                self.__current = None
+class GoroutineCmd(gdb.Command):
+        """Switch to the context of goroutine, and execute arbitrary gdb command.
 
-        def __enter__(self):
+Usage:
+    goroutine -- Display current goroutine
+    goroutine <goid> -- Select goroutine by goid
+
+Example: Print backtrace of all goroutines.
+    (gdb) goroutine all bt
+
+Example: Select a goroutine and print backtrace.
+    (gdb) goroutine 123
+    (gdb) bt
+
+Example: Select a goroutine and examine local variable of specific frame.
+    (gdb) goroutine 123
+    (gdb) frame 4
+    (gdb) info local
+        """
+
+        def __init__(self):
+                gdb.Command.__init__(self, "goroutine", gdb.COMMAND_STACK, gdb.COMPLETE_COMMAND)
+                gdb.events.cont.connect(self.__event_cont)
+                gdb.events.before_prompt.connect(self.__event_before_prompt)
+                self.__g = None
+
+        def __del__(self):
+                gdb.events.cont.disconnect(self.__event_cont)
+                gdb.events.before_prompt.disconnect(self.__event_before_prompt)
+                
+        def __event_cont(self, event):
+                if self.__g is not None:
+                        self.__detach()
+                        self.__g = None
+
+        def __event_before_prompt(self):
+                if self.__g is not None:
+                        line = gdb.execute("show commands", False, True).splitlines()[-1]
+                        args = gdb.string_to_argv(line)
+                        if args[1] == 't' or "thread".startswith(args[1]) and len(args[1]) > 3:
+                                if len(args) < 3 or args[2] != 'apply':
+                                        self.__detach()
+                                        self.__g = None
+                                        return
+                        self.__attach(self.__g)
+
+        def __attach(self, g):
                 class Unwinder(gdb.unwinder.Unwinder):
-                        def __init__(self, g):
+                        def __init__(self):
                                 super().__init__("Goroutine")
-                                self.__g = g
 
                         def __call__(self, pending_frame):
                                 if pending_frame.level() != 0:
+                                        return None
+
+                                line = gdb.execute("show commands", False, True).splitlines()[-1]
+                                args = gdb.string_to_argv(line)
+                                if args[1] == 't' or "thread".startswith(args[1]) and len(args[1]) >= 3:
                                         return None
 
                                 class FrameID:
@@ -585,7 +632,7 @@ class GoroutineContext:
                                                 self.sp = sp
                                                 self.pc = pc
 
-                                sp, pc = self.__g.sp, self.__g.pc
+                                sp, pc = g.sp, g.pc
 
                                 # create unwind_info with different sp
                                 frame_id = FrameID(sp - 32, pc)
@@ -598,14 +645,13 @@ class GoroutineContext:
                                 # Return the cache for GDB to use.
                                 return unwind_info
 
-                self.__current = gdb.selected_thread()
-                status = self.__g.status
+                status = g.status
                 if status == Goroutine.DEAD:
-                        return None
+                        return False
                 elif status == Goroutine.RUNNING or status == Goroutine.SYSCALL:
-                        thread = self.__g.thread
+                        thread = g.thread
                         if thread is None:
-                                return None
+                                return False
 
                         thread.switch()
                 else:
@@ -613,16 +659,16 @@ class GoroutineContext:
                                 thread.switch()
                                 frame = gdb.newest_frame()
                                 name = frame.name()
-                                if name in ("runtime.futex", "runtime.mcall", "runtime.schedule", "runtime.findRunnable", "runtime.futexsleep"):
+                                if name == "runtime.futex":
                                         break
                         else:
                                 thread = gdb.selected_thread()
 
-                        gdb.unwinder.register_unwinder(None, Unwinder(self.__g), replace=True)
+                        gdb.unwinder.register_unwinder(None, Unwinder(), replace=True)
 
-                return self
+                return True
 
-        def __exit__(self, type, value, trace):
+        def __detach(self):
                 class Unwinder(gdb.unwinder.Unwinder):
                         def __init__(self):
                                 super().__init__("Goroutine")
@@ -631,38 +677,6 @@ class GoroutineContext:
                                 return None
 
                 gdb.unwinder.register_unwinder(None, Unwinder(), replace=True)
-                self.__current.switch()
-
-        def select_frame(self, level):
-                gdb.execute("select-frame {}".format(level), False, True)
-
-
-class GoroutineCmd(gdb.Command):
-        """Switch to the context of goroutine, and execute arbitrary gdb command.
-
-Usage:
-    goroutine -- Display current goroutine
-    goroutine <goid> -- Select goroutine by goid
-    goroutine <gdb command> -- Execute gdb command for selected goroutine
-    goroutine all <gdb command> -- Apply gdb command to all goroutines
-
-Example: Print backtrace of all goroutines.
-    (gdb) goroutine all bt
-
-Example: Select a goroutine and print backtrace.
-    (gdb) goroutine 123
-    (gdb) goroutine bt
-
-Example: Select a goroutine and examine local variable of specific frame.
-    (gdb) goroutine 123
-    (gdb) goroutine frame 4
-    (gdb) goroutine info local
-        """
-
-        def __init__(self):
-                gdb.Command.__init__(self, "goroutine", gdb.COMMAND_STACK, gdb.COMPLETE_COMMAND)
-                self.__g = None
-                self.__frame = None
 
         def invoke(self, arg, _from_tty):
                 args = gdb.string_to_argv(arg)
@@ -680,40 +694,13 @@ Example: Select a goroutine and examine local variable of specific frame.
                                 print("Can not switch to the dead Goroutine {}".format(goid))
                         else:
                                 self.__g = g
-                                self.__frame = 0
                                 print("Switch to Goroutine {}".format(goid))
-                elif args[0] == "all":
-                        if len(args) > 1:
-                                self.__exec_all(args[1:])
-                elif self.__g is None:
-                        print("No Goroutine is selected")
-                else:
-                        with GoroutineContext(self.__g) as ctxt:
-                                if ctxt is None:
-                                        pass
-                                else:
-                                        ctxt.select_frame(self.__frame)
-                                        self.__exec(ctxt, args)
-                                        self.__frame = gdb.selected_frame().level()
-
-        def __exec(self, ctxt, args):
-                try:
-                        gdb.execute(" ".join(args))
-                except gdb.error as e:
-                        print(str(e))
-
-        def __exec_all(self, args):
-                for g in Goroutine.all():
-                        with GoroutineContext(g) as ctxt:
-                                if ctxt is None:
-                                        pass
-                                else:
+                elif args[0] == "all" and len(args) > 1:
+                        args = " ".join(args[1:])
+                        for g in Goroutine.all():
+                                if g.switch():
                                         g.print()
-                                        try:
-                                                gdb.execute(" ".join(args))
-                                        except gdb.error as e:
-                                                print(str(e))
-
+                                        gdb.execute(args)
                                         print()
 
 
