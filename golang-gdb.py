@@ -45,7 +45,7 @@ import re
 import sys
 import gdb
 import gdb.unwinder
-import gdb.FrameDecorator
+
 
 print("Loading Go Runtime support.", file=sys.stderr)
 #http://python3porting.com/differences.html
@@ -506,12 +506,11 @@ class Goroutine:
                                 Goroutine.format_address(bp)))
                 else:
                         thread = self.thread
-                        print("{} {:>4} ({} thread {} (Thread 0x{:08x} (LWP {})))".format(
+                        print("{} {:>4} ({} thread {} (LWP {}))".format(
                                 title,
                                 self.id,
                                 Goroutine.format_status(status),
                                 thread.global_num,
-                                int.from_bytes(thread.handle(), 'little'),
                                 thread.ptid[1]))
 
         @classmethod
